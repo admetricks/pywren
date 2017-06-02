@@ -46,14 +46,14 @@ def download_runtime_if_necessary(s3conn, runtime_s3_bucket, runtime_s3_key):
     """
 
     # get runtime etag
-    runtime_meta = s3conn.meta.client.head_object(Bucket=runtime_s3_bucket, 
+    runtime_meta = s3conn.meta.client.head_object(Bucket=runtime_s3_bucket,
                                                   Key=runtime_s3_key)
     # etags have strings (double quotes) on each end, so we strip those
     ETag = str(runtime_meta['ETag'])[1:-1]
     logger.debug("The etag is ={}".format(ETag))
     runtime_etag_dir = os.path.join(RUNTIME_LOC, ETag)
     logger.debug("Runtime etag dir={}".format(runtime_etag_dir))
-    expected_target = os.path.join(runtime_etag_dir, 'condaruntime')    
+    expected_target = os.path.join(runtime_etag_dir, 'condaruntime')
     logger.debug("Expected target={}".format(expected_target))
     # check if dir is linked to correct runtime
     if os.path.exists(RUNTIME_LOC):
@@ -72,20 +72,20 @@ def download_runtime_if_necessary(s3conn, runtime_s3_bucket, runtime_s3_key):
         os.unlink(CONDA_RUNTIME_DIR)
 
     shutil.rmtree(RUNTIME_LOC, True)
-    
+
     os.makedirs(runtime_etag_dir)
-    
-    res = s3conn.meta.client.get_object(Bucket=runtime_s3_bucket, 
+
+    res = s3conn.meta.client.get_object(Bucket=runtime_s3_bucket,
                                     Key=runtime_s3_key)
 
-    condatar = tarfile.open(mode= "r:gz", 
-                            fileobj = wrenutil.WrappedStreamingBody(res['Body'], 
+    condatar = tarfile.open(mode= "r:gz",
+                            fileobj = wrenutil.WrappedStreamingBody(res['Body'],
                                                                     res['ContentLength']))
 
 
     condatar.extractall(runtime_etag_dir)
 
-    # final operation 
+    # final operation
     os.symlink(expected_target, CONDA_RUNTIME_DIR)
     return False
 
@@ -99,9 +99,9 @@ def b64str_to_bytes(str_data):
 def aws_lambda_handler(event, context):
     logger.setLevel(logging.INFO)
     context_dict = {
-        'aws_request_id' : context.aws_request_id, 
-        'log_group_name' : context.log_group_name, 
-        'log_stream_name' : context.log_stream_name, 
+        'aws_request_id' : context.aws_request_id,
+        'log_group_name' : context.log_group_name,
+        'log_stream_name' : context.log_stream_name,
     }
     return generic_handler(event, context_dict)
 
@@ -109,13 +109,30 @@ def get_server_info():
 
     server_info = {'uname' : subprocess.check_output("uname -a", shell=True).decode("ascii") }
     if os.path.exists("/proc"):
-        server_info.update({'/proc/cpuinfo': open("/proc/cpuinfo", 'r').read(), 
-                            '/proc/meminfo': open("/proc/meminfo", 'r').read(), 
-                            '/proc/self/cgroup': open("/proc/meminfo", 'r').read(), 
+        server_info.update({'/proc/cpuinfo': open("/proc/cpuinfo", 'r').read(),
+                            '/proc/meminfo': open("/proc/meminfo", 'r').read(),
+                            '/proc/self/cgroup': open("/proc/meminfo", 'r').read(),
                             '/proc/cgroups': open("/proc/cgroups", 'r').read()})
 
 
     return server_info
+
+def delete_sqs_message(queue_url, receipt_handle):
+    if queue_url is not None and receipt_handle is not None:
+        logger.info("delete sqs message started")
+        sqs_client = boto3.client('sqs', region_name='us-east-1')
+
+        try:
+            response = sqs_client.delete_message(
+                QueueUrl=queue_url,
+                ReceiptHandle=receipt_handle
+            )
+            logger.info("delete sqs message complete")
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'ReceiptHandleIsInvalid':
+                pass
+            else:
+                raise e
 
 def generic_handler(event, context_dict):
     """
@@ -123,13 +140,26 @@ def generic_handler(event, context_dict):
     that we are running in, provided by the scheduler
     """
 
+    logger.info(json.dumps(event))
     try:
+        message_id = None
+        receipt_handle = None
+        queue_url = None
+        if 'Body' in event:
+            logger.info("invocation started from sqs")
+            old_event = event
+            event = json.loads(old_event['Body'])
+            logger.info(json.dumps(event))
+            queue_url = old_event['QueueUrl'] if 'QueueUrl' in old_event else None
+            receipt_handle = old_event['ReceiptHandle'] if 'ReceiptHandle' in old_event else None
+            message_id = old_event['MessageId'] if 'MessageId' in old_event else None
+
         response_status = {'exception' : None}
         s3 = boto3.resource('s3')
-        
+
         logger.info("invocation started")
 
-        # download the input 
+        # download the input
         status_key = event['status_key']
         func_key = event['func_key']
         data_key = event['data_key']
@@ -137,7 +167,7 @@ def generic_handler(event, context_dict):
         output_key = event['output_key']
 
         if version.__version__ != event['pywren_version']:
-            raise Exception("WRONGVERSION", "Pywren version mismatch", 
+            raise Exception("WRONGVERSION", "Pywren version mismatch",
                             version.__version__, event['pywren_version'])
 
         start_time = time.time()
@@ -159,9 +189,9 @@ def generic_handler(event, context_dict):
         job_max_runtime = event.get("job_max_runtime", 290) # default for lambda
 
         response_status['func_key'] = func_key
-        response_status['data_key'] = data_key 
+        response_status['data_key'] = data_key
         response_status['output_key'] = output_key
-        response_status['status_key'] = status_key 
+        response_status['status_key'] = status_key
 
         b, k = data_key
         KS =  s3util.key_size(b, k)
@@ -176,7 +206,7 @@ def generic_handler(event, context_dict):
 
 
 
-        # get the input and save to disk 
+        # get the input and save to disk
         # FIXME here is we where we would attach the "canceled" metadata
         s3.meta.client.download_file(func_key[0], func_key[1], func_filename)
         func_download_time = time.time() - start_time
@@ -188,7 +218,7 @@ def generic_handler(event, context_dict):
             s3.meta.client.download_file(data_key[0], data_key[1], data_filename)
         else:
             range_str = 'bytes={}-{}'.format(*data_byte_range)
-            dres = s3.meta.client.get_object(Bucket=data_key[0], Key=data_key[1], 
+            dres = s3.meta.client.get_object(Bucket=data_key[0], Key=data_key[1],
                                              Range=range_str)
             data_fid = open(data_filename, 'wb')
             data_fid.write(dres['Body'].read())
@@ -228,7 +258,7 @@ def generic_handler(event, context_dict):
 
         response_status['runtime_s3_key_used'] = runtime_s3_key_used
         response_status['runtime_s3_bucket_used'] = runtime_s3_bucket_used
-        
+
         runtime_cached = download_runtime_if_necessary(s3, runtime_s3_bucket_used,
                                                        runtime_s3_key_used)
         logger.info("Runtime ready, cached={}".format(runtime_cached))
@@ -248,10 +278,10 @@ def generic_handler(event, context_dict):
         CONDA_PYTHON_PATH = "/tmp/condaruntime/bin"
         CONDA_PYTHON_RUNTIME = os.path.join(CONDA_PYTHON_PATH, "python")
 
-        cmdstr = "{} {} {} {} {}".format(CONDA_PYTHON_RUNTIME, 
-                                         jobrunner_path, 
-                                         func_filename, 
-                                         data_filename, 
+        cmdstr = "{} {} {} {} {}".format(CONDA_PYTHON_RUNTIME,
+                                         jobrunner_path,
+                                         func_filename,
+                                         data_filename,
                                          output_filename)
 
         setup_time = time.time()
@@ -267,7 +297,7 @@ def generic_handler(event, context_dict):
         logger.debug("command str=%s", cmdstr)
         # This is copied from http://stackoverflow.com/a/17698359/4577954
         # reasons for setting process group: http://stackoverflow.com/a/4791612
-        process = subprocess.Popen(cmdstr, shell=True, env=local_env, bufsize=1, 
+        process = subprocess.Popen(cmdstr, shell=True, env=local_env, bufsize=1,
                                    stdout=subprocess.PIPE, preexec_fn=os.setsid)
 
         logger.info("launched process")
@@ -284,7 +314,7 @@ def generic_handler(event, context_dict):
 
         stdout = b""
         while t.isAlive():
-            try: 
+            try:
                 line = q.get_nowait()
                 stdout += line
                 logger.info(line)
@@ -294,14 +324,14 @@ def generic_handler(event, context_dict):
             if total_runtime > job_max_runtime:
                 logger.warn("Process exceeded maximum runtime of {} sec".format(job_max_runtime))
                 # Send the signal to all the process groups
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)  
-                raise Exception("OUTATIME", 
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                raise Exception("OUTATIME",
                                 "Process executed for too long and was killed")
 
 
         logger.info("command execution finished")
 
-        s3.meta.client.upload_file(output_filename, output_key[0], 
+        s3.meta.client.upload_file(output_filename, output_key[0],
                                    output_key[1])
         logger.debug("output uploaded to %s %s", output_key[0], output_key[1])
 
@@ -316,7 +346,7 @@ def generic_handler(event, context_dict):
         response_status['host_submit_time'] = event['host_submit_time']
         response_status['server_info'] = get_server_info()
 
-        response_status.update(context_dict) 
+        response_status.update(context_dict)
     except Exception as e:
         # internal runtime exceptions
         response_status['exception'] = str(e)
@@ -324,15 +354,18 @@ def generic_handler(event, context_dict):
         response_status['exception_traceback'] = traceback.format_exc()
     finally:
 
-        s3.meta.client.put_object(Bucket=status_key[0], Key=status_key[1], 
+        s3.meta.client.put_object(Bucket=status_key[0], Key=status_key[1],
                                   Body=json.dumps(response_status))
-    
+
+        if not response_status['exception']:
+            delete_sqs_message(queue_url, receipt_handle)
+
 
 if __name__ == "__main__":
     s3 = boto3.resource('s3')
     #s3.meta.client.download_file('ericmjonas-public', 'condaruntime.tar.gz', '/tmp/condaruntime.tar.gz')
     res = s3.meta.client.get_object(Bucket='ericmjonas-public', Key='condaruntime.tar.gz')
 
-    condatar = tarfile.open(mode= "r:gz", 
+    condatar = tarfile.open(mode= "r:gz",
                             fileobj = WrappedStreamingBody(res['Body'], res['ContentLength']))
     condatar.extractall('/tmp/test1/')
